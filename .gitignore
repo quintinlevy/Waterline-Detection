@@ -2,3 +2,4 @@ out/
 cleanup/
 __pycache__/
 videos/
+out_lite/
