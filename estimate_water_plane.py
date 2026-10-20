@@ -114,31 +114,41 @@ def median_over_frames(stack: np.ndarray, min_valid: float) -> tuple[np.ndarray,
 # counts < ... --> ex. [False, True]: pixel 1 doesn't have enough
 # med[[False, True]] = np.nan --> if pixel doesnt have enough samples then set median coordinates to NaN
 
-
+# Need to verify this section
+# this accounts for the fact that the original pixels were measured some distance above the actual waterline
+# so it attempts to reduce the introduced error
+# water_pts --> table of measured wall pts [x,y,z]
+# line_px --> table of matching waterline pixels (row i gies with row i of wall_pts)
+# cam_info --> cam_info.cx reads its cx value
 def project_to_waterline(wall_pts: np.ndarray, line_px: np.ndarray, cam_info) -> np.ndarray:
     """Place each point on its waterline pixel's ray at the wall's depth Z."""
-    z = wall_pts[:, 2]
-    x = (line_px[:, 0] - cam_info.cx) * z / cam_info.fx
-    y = (line_px[:, 1] - cam_info.cy) * z / cam_info.fy
+    z = wall_pts[:, 2]                                      # Z = depth: distance straight ahdead in meters
+    x = (line_px[:, 0] - cam_info.cx) * z / cam_info.fx     # u, v = pixel (column, row)
+    y = (line_px[:, 1] - cam_info.cy) * z / cam_info.fy     # cx, cy = image center in pixels | fx, fy = focal length, in pixels (how zoomed in)
     return np.stack([x, y, z], axis=1)
 
-
+# accel --> all the accelerometer readings, one per frame. ex. shape (60, 3) for 60 rows of 3 numbers
+# imu_to_cam --> 3x3 grid of numbers (rotation matrix) that converts from IMU to camera axis. (obtained from camera)
+# down - is gravity vector in terms of camera coordinate space
+# spread - is percieved noise/varance in each "down" measurement
 def gravity_down(accel: np.ndarray, imu_to_cam: np.ndarray) -> tuple[np.ndarray, float]:
     """Unit 'down' vector in the camera frame from accelerometer samples (IMU
     frame, reading UP at rest). Also returns the samples' angular spread (deg)."""
-    up_imu = accel.mean(axis=0)
-    down = -(imu_to_cam @ up_imu)
-    down /= np.linalg.norm(down)
-    dirs = -(accel @ imu_to_cam.T)
+    up_imu = accel.mean(axis=0)     # averages down rows, giving 3 numbers
+    down = -(imu_to_cam @ up_imu)   # rotate the direction from IMU axes to camera axes (@ = dot product), then flip
+    down /= np.linalg.norm(down)    # linalg gives length of direction, /= --> down = down / length (i.e. get unit vector)
+    # next 3 lines only measure how noisy the sensor was (for report/debug)
+    dirs = -(accel @ imu_to_cam.T) 
     dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
     spread = np.degrees(np.arccos(np.clip(dirs @ down, -1, 1))).std() if len(accel) > 1 else 0.0
     return down, float(spread)
 
-
+# down - "down" vector from gravity_down(), 3 numbers of length 1.
+# points - waterline points from project_to_waterline, of shape (M,3) with one [x,y,z] per row
 def fit_plane(down: np.ndarray, points: np.ndarray) -> dict:
     """Plane with normal `down` through the points: d = median(down . p)."""
-    h = points @ down
-    d = float(np.median(h))
+    h = points @ down       # how far below the camera the waterline is along gravity vector (dot product @)
+    d = float(np.median(h)) # find median of h
     mad = float(np.median(np.abs(h - d)) * 1.4826)
     return {"d": d, "heights": h, "height_std_m": float(h.std()), "height_mad_m": mad}
 
