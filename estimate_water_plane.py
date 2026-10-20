@@ -75,32 +75,44 @@ def sample_pixels(waterline: dict, n_samples: int, pixels_above: int):
     wall_px = np.stack([us, np.round(vs - pixels_above)], axis=1).astype(int) # move vert. position up in pixels then round to int type
     return line_px, wall_px # returns the line pixels as well as the pixels on the wall to be sampled
 
-
+# cam      --> the camera object
+# pixels   --> table of [u,v] pixels to measure
+# frames   --> which frames to read from (e.g. range(0,60) --> frames 0 to 59)
+# this function gathers 3d points for each pixel of interest, and also samples IMU from camera for gravity vector
 def read_points(cam, pixels: np.ndarray, frames) -> tuple[np.ndarray, np.ndarray]:
     """3D points at `pixels` for every frame, plus one accelerometer sample per
     frame. Returns ((F, K, 3) points with NaN for invalid, (F, 3) accel)."""
-    pts, accel = [], []
+    pts, accel = [], [] # lists for points and acceleromneter readings for each frame
     for i in frames:
-        cam.set_frame(i)
-        if not cam.grab():
+        cam.set_frame(i)                        # jump to frame i in video (ZED SDK - set_svo_position)
+        if not cam.grab():                      # was frame grabbed?
             break
-        pts.append(cam.get_xyz(pixels))
-        accel.append(cam.get_accelerometer())
-    if not pts:
+        pts.append(cam.get_xyz(pixels))         # get 3d position from pixel locations (camera object has reference to its own current frame)
+        accel.append(cam.get_accelerometer())   # get accelerometer reading for frame (during frame)
+    if not pts: #if no frames were gathered (ERROR)
         raise RuntimeError("No frames could be read from the recording")
-    return np.array(pts), np.array(accel)
+    return np.array(pts), np.array(accel)       # return the array of 3d points, as well as array of gravity vector samples
 
-
+# med -->   array with median measurements (x,y,z) for each pixel
+# min_valid --> threshold for amount of valid measurements per pixel
 def median_over_frames(stack: np.ndarray, min_valid: float) -> tuple[np.ndarray, np.ndarray]:
     """Per-pixel median over frames, ignoring NaN. Pixels valid in fewer than
     `min_valid` (fraction) of frames become NaN. Returns (points, valid counts)."""
-    valid = ~np.isnan(stack).any(axis=2)
-    counts = valid.sum(axis=0)
-    with warnings.catch_warnings():
+    valid = ~np.isnan(stack).any(axis=2)    # marks each number as True where NaN, converts each pixel measurement as T/F, flips with ~ (now a 2d mask for each frames pixel measurement on whether valid or not)
+    counts = valid.sum(axis=0)              # count number of measurements for a pixel per frame (e.g. pixel 0 has 4 valid frames) e.g. counts [3, 1] <-- pixel 0 valid in 3 frames, pixel 1 in only 1
+    # if pixel is NaN for every frame, nanmedian returns NaN. this block silence warnings (keep an eye on this though, could lead to silent failures?)
+    with warnings.catch_warnings():         
         warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN pixels -> NaN, expected
-        med = np.nanmedian(stack, axis=0)
-    med[counts < max(1, min_valid * len(stack))] = np.nan
+        med = np.nanmedian(stack, axis=0)   # for each pixel and each x,y,z take median across frames (ignoring NaN)
+    med[counts < max(1, min_valid * len(stack))] = np.nan # marks each pixel with not enough points as invalud (NaN)
     return med, counts
+
+# Notes on above
+# len(stack) --> number of frames (1st dimmensions)
+# min_valid * len(stack) --> min number of valid frames
+# max(1, ...) makes sure min is at least 1 frame
+# counts < ... --> ex. [False, True]: pixel 1 doesn't have enough
+# med[[False, True]] = np.nan --> if pixel doesnt have enough samples then set median coordinates to NaN
 
 
 def project_to_waterline(wall_pts: np.ndarray, line_px: np.ndarray, cam_info) -> np.ndarray:
