@@ -12,7 +12,7 @@ The plane is written as   n . X = d
 Method:
   1. Pick sample columns along the waterline (inlier points only).
   2. In each column, sample the wall N pixels ABOVE the line, where stereo
-     depth is reliable (depth on the water itself is not).
+     depth is reliable (b/c depth on the water itself is not).
   3. Read the 3D point there in every frame of the clip; the SDK's confidence
      threshold turns unreliable pixels into NaN, which are skipped. Take the
      per-pixel median over frames.
@@ -32,36 +32,48 @@ Until zed_real.py exists, run with --stub (uses zed_stub.StubCamera):
     python estimate_water_plane.py --waterline out_stub/waterline.json --stub
 """
 
-import argparse
-import json
-import sys
-import warnings
-from pathlib import Path
+import argparse             # CLI library
+import json                 # JSON library
+import sys                  # 
+import warnings             #
+from pathlib import Path    #
 
-import numpy as np
+import numpy as np          # it's numpy
 
-
+# returns dictionary from waterline json
 def load_waterline(path) -> dict:
     with open(path) as f:
         return json.load(f)
 
-
+# Given the json pixels of interest, desired number of samples, and a pixel offset
+# this function will return a set of points evenly spaced throughout the samples of interest
+# the points will be generated using the line best fit gained from the detect_waterline.py script
+# it also returns a second set of points which assumes a pixel offset from the detected waterline
 def sample_pixels(waterline: dict, n_samples: int, pixels_above: int):
     """Evenly spaced columns over the inlier waterline points.
 
     Returns (line_px, wall_px): (M, 2) float pixels on the fitted line, and
     (M, 2) int pixels N rows above them (on the wall)."""
-    line = waterline["line"]
-    pts = np.asarray(waterline["points_xy"], float)
-    inlier = np.asarray(waterline["inlier"], bool)
-    us = np.unique(pts[inlier, 0])
+    line = waterline["line"]                            # get line best fit from json (dict)
+    pts = np.asarray(waterline["points_xy"], float)     # construct array from waterline points detected (from json)
+    inlier = np.asarray(waterline["inlier"], bool)      # True/False mask if point was inlier of line best fit waterline
+    us = np.unique(pts[inlier, 0])                      # find which columns (px) are going to be used (get columns from points via mask)
     if len(us) == 0:
         raise ValueError("waterline.json has no inlier points")
+    # len(us)      --> how many inlier points we have
+    # n_samples    --> how many desired samples we want (# samples is min of len(us) and n_samples)
+    # linspace(start, stop, count) --> gives count evenly spaced numbers from start to stop
+    # linespace    --> min() samples from 0 to last of valid
+    # np.round()   --> positions must be whole numbers (linespace can return evenly spaced points which are not whole)
+    # .astype(int) --> converts decimal type to integer type
+    # np.unique()  --> theoretically shouldnt matter if you have significant number of column samples where col >> n_samples
+    #                  ^^^Just checks for unique points in case of weird case of too many samples whith not enough columns available
+    # us = us[...] --> replace array with all column nums with evenly spaced sample locations
     us = us[np.unique(np.round(np.linspace(0, len(us) - 1, min(n_samples, len(us)))).astype(int))]
-    vs = line["slope"] * us + line["intercept"]
-    line_px = np.stack([us, vs], axis=1)
-    wall_px = np.stack([us, np.round(vs - pixels_above)], axis=1).astype(int)
-    return line_px, wall_px
+    vs = line["slope"] * us + line["intercept"] # get veritcal positions (y) for each column sample using line best fit
+    line_px = np.stack([us, vs], axis=1) # combine points into pairs together into 1 array
+    wall_px = np.stack([us, np.round(vs - pixels_above)], axis=1).astype(int) # move vert. position up in pixels then round to int type
+    return line_px, wall_px # returns the line pixels as well as the pixels on the wall to be sampled
 
 
 def read_points(cam, pixels: np.ndarray, frames) -> tuple[np.ndarray, np.ndarray]:
