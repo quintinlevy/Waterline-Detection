@@ -11,8 +11,11 @@ scene, so tests can compare the recovered plane with the true one:
     * a vertical far wall at a known distance
     * stereo-like depth noise that grows with distance squared, including a
       fixed per-pixel bias (real stereo errors repeat from frame to frame)
-    * no depth on the water or sky (NaN), noisier depth just above the
-      waterline, occasional wild outliers
+    * depth on the water surface (ripples give it texture, as seen with the
+      real ZED X), with a few reflection-like readings that land too far
+      away; no depth on the sky (NaN); noisier depth just above the
+      waterline; occasional wild outliers. Set water_depth=False to make
+      the water return NaN instead.
     * SDK-style confidence filtering: pixels whose confidence value is above
       the threshold come back as NaN (in the ZED SDK, lower value = more
       confident; verify for your SDK version)
@@ -92,6 +95,9 @@ class StubScene:
     depth_bias: float = 0.0005        # fixed per-pixel bias std = depth_bias * Z^2
     edge_px: int = 4                  # band above the waterline with poor depth
     outlier_fraction: float = 0.01    # wild depth values that still pass confidence
+    water_depth: bool = True          # False = no depth on the water (NaN)
+    ripple: float = 0.005             # water surface height wobble per frame (std, m)
+    reflection_fraction: float = 0.03 # water pixels showing a persistent reflection (read too far)
     accel_noise: float = 0.02         # m/s^2 per sample
     accel_bias: tuple = (0.0, 0.0, 0.0)  # constant accelerometer bias, IMU frame
     imu_rotation_deg: tuple = (0.5, -0.3, 0.2)  # IMU axes vs camera axes (x, y, z)
@@ -124,14 +130,28 @@ class StubScene:
         u = np.asarray(u, float)
         return self.cy - self.fy * (a[2] + a[0] * (u - self.cx) / self.fx) / a[1]
 
+    def is_water(self, u, v) -> np.ndarray:
+        """True where the pixel's ray hits the water before reaching the wall."""
+        r = self.rays(u, v)
+        t = self.wall_distance / (r @ self.forward())
+        height = self.camera_height - (t[..., None] * r) @ self.down()
+        return (r @ self.down() > 0) & ((t <= 0) | (height < 0))
+
     def true_xyz(self, u, v) -> np.ndarray:
-        """Noise-free 3D point seen at pixel (u, v); NaN for water or sky."""
+        """Noise-free 3D point seen at pixel (u, v): the wall, the water surface
+        (NaN if water_depth is False), or NaN for the sky."""
         r = self.rays(u, v)
         t = self.wall_distance / (r @ self.forward())
         p = t[..., None] * r
         height = self.camera_height - p @ self.down()     # above the water
-        visible = (t > 0) & (height >= 0) & (height <= self.wall_top)
-        p[~visible] = np.nan
+        on_wall = (t > 0) & (height >= 0) & (height <= self.wall_top)
+        water = self.is_water(u, v)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_water = self.camera_height / (r @ self.down())
+        p_water = t_water[..., None] * r
+        p = np.where(on_wall[..., None], p, np.nan)
+        if self.water_depth:
+            p = np.where(water[..., None], p_water, p)
         return p
 
 
@@ -144,6 +164,7 @@ class StubCamera:
         self.seed = seed
         self.frame = 0
         self._rng = None
+        self._bias = {}     # fixed per-pixel bias, cached: same value every frame
 
     def open(self, svo_path=None) -> CameraInfo:
         """svo_path is ignored; the stub always 'plays' its fake scene."""
@@ -171,12 +192,32 @@ class StubCamera:
         z = p[:, 2]
 
         # Fixed per-pixel bias (same every frame) + per-frame noise, along the ray.
-        unit_bias = np.array([np.random.default_rng((self.seed, 999, int(a), int(b))).normal()
-                              for a, b in zip(u, v)])
+        for a, b in zip(u, v):
+            if (a, b) not in self._bias:
+                self._bias[(a, b)] = np.random.default_rng((self.seed, 999, int(a), int(b))).normal()
+        unit_bias = np.array([self._bias[(a, b)] for a, b in zip(u, v)])
         bias = unit_bias * s.depth_bias * z ** 2
         near_edge = (s.waterline_v(u) - v >= 0) & (s.waterline_v(u) - v < s.edge_px)
         noise = rng.normal(0, 1, len(u)) * s.depth_noise * z ** 2 * np.where(near_edge, 3.0, 1.0)
         p = p + ((bias + noise) / r[:, 2])[:, None] * r
+
+        # Water: ripples move the surface up and down a little each frame. A few
+        # water pixels show a reflection (e.g. a tree) instead; like real
+        # reflections they persist, reading too far away in most frames, so
+        # the median over frames does NOT remove them; the plane fit must.
+        water = s.is_water(u, v) & s.water_depth
+        if water.any():
+            down_r = r[water] @ s.down()
+            dh = rng.normal(0, s.ripple, water.sum())
+            p[water] += (dh / down_r)[:, None] * r[water]
+            for i in np.flatnonzero(water):
+                key = ("mirror", u[i], v[i])
+                if key not in self._bias:
+                    m_rng = np.random.default_rng((self.seed, 777, int(u[i]), int(v[i])))
+                    self._bias[key] = (m_rng.random() < s.reflection_fraction, m_rng.uniform(1.2, 2.0))
+                is_mirror, stretch = self._bias[key]
+                if is_mirror and rng.random() < 0.8:
+                    p[i] *= stretch
 
         wild = rng.random(len(u)) < s.outlier_fraction
         p[wild] *= rng.uniform(0.5, 1.5, (wild.sum(), 1))
