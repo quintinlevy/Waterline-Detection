@@ -14,6 +14,9 @@ Shown:
     * the sample points each plane was built from (surface method: red = points
       the fitted plane rejected as outliers)
     * the origin mark and the point below it on the water, if present
+    * a side panel listing each plane's camera height d (m and ft) and the
+      angle between its normal and the IMU's down direction, treated as the
+      source of truth (the first 'IMU plane' loaded; --reference overrides)
 
 Display axes: the camera frame has y pointing DOWN, which would draw the scene
 upside-down, so for display only we use  X = x (right), Y = z (forward),
@@ -48,16 +51,21 @@ def load_planes(path) -> list[dict]:
     samples = data.get("samples", [])
     pts = np.array([s["point_m"] for s in samples], float).reshape(-1, 3)
     origin = data.get("origin")
+    # "imu": "plane"   = the plane's normal IS the IMU's down direction (gravity)
+    #        "gravity" = also gravity-based, but from the waterline method
+    #        None      = normal comes from the depth points only (fitted plane)
     if "plane" in data:                                    # estimate_water_plane.py
         return [{"label": f"{name}: waterline method", "normal": data["plane"]["normal"],
-                 "d": data["plane"]["d"], "points": pts, "inlier": None, "origin": origin}]
+                 "d": data["plane"]["d"], "points": pts, "inlier": None, "origin": origin,
+                 "imu": "gravity"}]
     if "imu_plane" in data:                                # estimate_water_surface.py
         inl = np.array([s.get("fit_inlier", True) for s in samples], bool)
         return [{"label": f"{name}: IMU plane", "normal": data["imu_plane"]["normal"],
-                 "d": data["imu_plane"]["d"], "points": pts, "inlier": None, "origin": origin},
+                 "d": data["imu_plane"]["d"], "points": pts, "inlier": None, "origin": origin,
+                 "imu": "plane"},
                 {"label": f"{name}: fitted plane", "normal": data["fitted_plane"]["normal"],
                  "d": data["fitted_plane"]["d"], "points": pts, "inlier": inl, "origin": None,
-                 "hide_points": True}]               # same points as the IMU plane; drawn once
+                 "imu": None, "hide_points": True}]  # same points as the IMU plane; drawn once
     raise ValueError(f"{path}: not a plane result (no 'plane' or 'imu_plane' key)")
 
 
@@ -99,7 +107,39 @@ def arrow(fig, start, end, color, name, width=6, show_legend=False, group=None):
                           legendgroup=group, hoverinfo="name"))
 
 
-def build_figure(planes: list[dict], axis_len=0.5) -> go.Figure:
+def default_reference(planes: list[dict]) -> int:
+    """Index of the plane whose normal is the IMU's down direction: the first
+    'IMU plane' (water-surface method) if any, else the first gravity-based plane."""
+    for kind in ("plane", "gravity"):
+        for i, pl in enumerate(planes):
+            if pl.get("imu") == kind:
+                return i
+    return 0
+
+
+def summary_lines(planes: list[dict], reference: int | None = None) -> list[str]:
+    """Side-panel text: each plane's camera height d, and the angle between its
+    normal and the reference "down" direction (by default the IMU's), degrees."""
+    if reference is None:
+        reference = default_reference(planes)
+    ref = np.asarray(planes[reference]["normal"], float)
+    ref /= np.linalg.norm(ref)
+    is_imu = planes[reference].get("imu") is not None
+    ref_name = "IMU down" if is_imu else "reference"
+    lines = ["<b>Camera height above plane (d)</b>",
+             f"<b>and tilt vs {ref_name}</b> (from #{reference + 1})", ""]
+    for i, pl in enumerate(planes):
+        n = np.asarray(pl["normal"], float)
+        n /= np.linalg.norm(n)
+        angle = np.degrees(np.arccos(np.clip(n @ ref, -1, 1)))
+        tag = f"  ({ref_name}: reference)" if i == reference else f"  {angle:.3f} deg"
+        lines += [f"#{i + 1} {pl['label']}",
+                  f"    d = {pl['d']:.4f} m  ({pl['d'] / 0.3048:.3f} ft)",
+                  f"    tilt vs {ref_name}:{tag}", ""]
+    return lines
+
+
+def build_figure(planes: list[dict], axis_len=0.5, reference: int | None = None) -> go.Figure:
     fig = go.Figure()
 
     # Camera at the origin, with its own axes (labelled in camera terms).
@@ -158,11 +198,19 @@ def build_figure(planes: list[dict], axis_len=0.5) -> go.Figure:
                                        text=["origin mark", f"{o['height_above_water_m']:.3f} m above water"],
                                        textposition="top center", name="origin", legendgroup=group))
 
+    # Side panel (outside the 3D space): d and tilt difference for every plane.
+    fig.add_annotation(text="<br>".join(summary_lines(planes, reference)),
+                       xref="paper", yref="paper", x=1.02, y=0.0, xanchor="left", yanchor="bottom",
+                       align="left", showarrow=False, bordercolor="#999", borderwidth=1,
+                       borderpad=6, bgcolor="rgba(255,255,255,0.9)",
+                       font=dict(family="Consolas, Courier New, monospace", size=12))
+
     fig.update_layout(
         title="Estimated water planes (camera at origin)",
         scene=dict(xaxis_title="X right (m)", yaxis_title="Y forward (m)", zaxis_title="Z up (m)",
                    aspectmode="data", camera=dict(eye=dict(x=-1.7, y=-2.6, z=1.4))),
-        legend=dict(itemsizing="constant"), margin=dict(l=0, r=0, t=40, b=0))
+        legend=dict(itemsizing="constant", x=1.02, y=1.0, xanchor="left", yanchor="top"),
+        margin=dict(l=0, r=420, t=40, b=0))
     return fig
 
 
@@ -170,13 +218,19 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Interactive 3D view of estimated water planes.")
     p.add_argument("results", nargs="+", help="plane.json / plane_surface.json files")
     p.add_argument("-o", "--output", default="planes.html", help="HTML file to write")
+    p.add_argument("--reference", type=int,
+                   help="plane number (as listed in the side panel) to compare tilts against; "
+                        "default: the IMU down direction (first 'IMU plane')")
     a = p.parse_args(argv)
     planes = [pl for path in a.results for pl in load_planes(path)]
-    fig = build_figure(planes)
+    if a.reference is not None and not 1 <= a.reference <= len(planes):
+        p.error(f"--reference must be between 1 and {len(planes)}")
+    ref = default_reference(planes) if a.reference is None else a.reference - 1
+    fig = build_figure(planes, reference=ref)
     Path(a.output).parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(a.output, include_plotlyjs=True)
-    for pl in planes:
-        print(f"{pl['label']}: d = {pl['d']:.4f} m, normal = {np.round(pl['normal'], 4).tolist()}")
+    for line in summary_lines(planes, ref):
+        print(line.replace("<b>", "").replace("</b>", ""))
     print(f"Wrote {a.output} - open it in a web browser")
 
 

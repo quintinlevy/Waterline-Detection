@@ -49,6 +49,26 @@ def test_end_to_end_html(tmp_path):
     assert out.exists() and out.stat().st_size > 100_000
 
 
+def test_summary_panel_heights_and_angles():
+    tilted = np.array([np.sin(np.radians(2)), np.cos(np.radians(2)), 0.0])   # 2 deg from +y
+    planes = [{"label": "a", "normal": [0, 1, 0], "d": 0.5},
+              {"label": "b", "normal": tilted.tolist(), "d": 0.6096}]
+    text = "\n".join(vp.summary_lines(planes, reference=0))
+    assert "d = 0.5000 m" in text and "(2.000 ft)" in text      # 0.6096 m = 2 ft
+    assert "reference)" in text and "2.000 deg" in text
+    text = "\n".join(vp.summary_lines(planes, reference=1))      # reference can be any plane
+    assert "from #2" in text and "2.000 deg" in text
+
+
+def test_default_reference_is_imu_down():
+    planes = [{"label": "w", "normal": [0, 1, 0], "d": 0.5, "imu": "gravity"},
+              {"label": "fit", "normal": [0, 1, 0], "d": 0.5, "imu": None},
+              {"label": "imu", "normal": [0, 1, 0], "d": 0.5, "imu": "plane"}]
+    assert vp.default_reference(planes) == 2                     # the IMU plane wins
+    assert vp.default_reference(planes[:2]) == 0                 # else the gravity-based one
+    assert "tilt vs IMU down" in "\n".join(vp.summary_lines(planes))
+
+
 def test_rejects_unknown_json(tmp_path):
     (tmp_path / "x.json").write_text('{"something": 1}')
     with pytest.raises(ValueError, match="not a plane result"):
